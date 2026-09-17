@@ -1,0 +1,16 @@
+{
+  "name": "team-z-backend",
+  "version": "1.0.0",
+  "description": "Backend server for Team Z Coaching Pilot - holds one Anthropic API key, proxies chat requests for any browser.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "cors": "^2.8.6",
+    "express": "^4.22.3"
+  }
+}
