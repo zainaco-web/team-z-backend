@@ -58,7 +58,7 @@ function readStore(){
   try{
     if(fs.existsSync(STORE_FILE)) return JSON.parse(fs.readFileSync(STORE_FILE, 'utf8'));
   }catch(err){ console.error('Reading store failed:', err); }
-  return { teamProgress: [], assignments: [] };
+  return { teamProgress: [], assignments: [], feedback: [] };
 }
 function writeStore(data){
   try{
@@ -93,6 +93,18 @@ app.post('/api/store/assignments', (req, res) => {
   if(!Array.isArray(assignments)) return res.status(400).json({ error: 'Request body must be an array of assignments.' });
   const data = readStore();
   data.assignments = assignments;
+  const saved = writeStore(data);
+  res.json({ ok: true, persisted: DISK_MOUNTED, saved });
+});
+
+// POST a single new feedback entry. Appends, doesn't overwrite - so a TL can see every submission,
+// not just the latest, and a submitter never overwrites someone else's note.
+app.post('/api/store/feedback', (req, res) => {
+  const entry = req.body;
+  if(!entry || typeof entry !== 'object') return res.status(400).json({ error: 'Request body must be a feedback entry object.' });
+  const data = readStore();
+  data.feedback = data.feedback || [];
+  data.feedback.push(entry);
   const saved = writeStore(data);
   res.json({ ok: true, persisted: DISK_MOUNTED, saved });
 });
