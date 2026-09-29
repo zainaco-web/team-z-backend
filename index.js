@@ -42,7 +42,7 @@ app.get('/', (req, res) => {
   });
 });
 
-// ---------- SHARED STORE (team progress + assignments, visible to everyone using this backend) ----------
+// ---------- SHARED STORE (team progress, assignments, rosters, directory, feedback - visible to everyone using this backend) ----------
 const DATA_DIR = process.env.DATA_DIR || '/data';
 const STORE_FILE = path.join(DATA_DIR, 'store.json');
 let DISK_MOUNTED = false;
@@ -54,11 +54,16 @@ try{
   console.warn(`No writable persistent disk at ${DATA_DIR} - shared data will not survive a restart. See README for how to attach one.`);
 }
 
+// Everything below runs synchronously (readFileSync/writeFileSync, no async/await between
+// reading a record and writing it back) and Node is single-threaded, so each request's
+// read-modify-write completes before the next request's handler runs. That's what makes the
+// per-record endpoints below (assignments/:id, feedback/:id) safe against two TLs editing at
+// the same time - there's no window where one request's write can silently overwrite another's.
 function readStore(){
   try{
     if(fs.existsSync(STORE_FILE)) return JSON.parse(fs.readFileSync(STORE_FILE, 'utf8'));
   }catch(err){ console.error('Reading store failed:', err); }
-  return { teamProgress: [], assignments: [], feedback: [] };
+  return { teamProgress: [], assignments: [], tlRosters: [], agentDirectory: [], manualNameOverrides: {}, feedback: [] };
 }
 function writeStore(data){
   try{
@@ -71,12 +76,12 @@ function writeStore(data){
   }
 }
 
-// GET the whole shared store (team progress + assignments) in one call - simple for a small team.
+// GET the whole shared store in one call - simple for a small team.
 app.get('/api/store', (req, res) => {
   res.json(readStore());
 });
 
-// POST a single new team-progress entry (one completed attempt). Appends, doesn't overwrite.
+// POST a single new team-progress entry (one completed attempt, or a TL-review record). Appends, doesn't overwrite.
 app.post('/api/store/team-progress', (req, res) => {
   const entry = req.body;
   if(!entry || typeof entry !== 'object') return res.status(400).json({ error: 'Request body must be an attempt entry object.' });
@@ -87,7 +92,12 @@ app.post('/api/store/team-progress', (req, res) => {
   res.json({ ok: true, persisted: DISK_MOUNTED, saved });
 });
 
-// POST the full assignments array (TL side overwrites the whole list - low write frequency, simple wins here).
+// ---- Assignments ----
+// Legacy endpoint, kept for backward compatibility with any frontend build that hasn't picked
+// up the per-record endpoints below yet: POSTs the full array (TL side overwrites the whole
+// list). This has a real lost-update risk if two TLs save around the same time, which is why
+// new code should use the three endpoints below instead. Left in place so an old cached
+// frontend never 404s.
 app.post('/api/store/assignments', (req, res) => {
   const assignments = req.body;
   if(!Array.isArray(assignments)) return res.status(400).json({ error: 'Request body must be an array of assignments.' });
@@ -97,14 +107,103 @@ app.post('/api/store/assignments', (req, res) => {
   res.json({ ok: true, persisted: DISK_MOUNTED, saved });
 });
 
-// POST a single new feedback entry. Appends, doesn't overwrite - so a TL can see every submission,
-// not just the latest, and a submitter never overwrites someone else's note.
+// Create ONE new assignment. Body is a single assignment object (must include an "id").
+app.post('/api/store/assignments/new', (req, res) => {
+  const entry = req.body;
+  if(!entry || typeof entry !== 'object' || !entry.id) return res.status(400).json({ error: 'Request body must be an assignment object with an "id" field.' });
+  const data = readStore();
+  data.assignments = data.assignments || [];
+  data.assignments.push(entry);
+  const saved = writeStore(data);
+  res.json({ ok: true, persisted: DISK_MOUNTED, saved });
+});
+
+// Merge-update ONE assignment by id (e.g. marking it completed, or linking it to an attempt).
+app.patch('/api/store/assignments/:id', (req, res) => {
+  const patch = req.body;
+  if(!patch || typeof patch !== 'object') return res.status(400).json({ error: 'Request body must be an object of fields to update.' });
+  const data = readStore();
+  data.assignments = data.assignments || [];
+  const idx = data.assignments.findIndex(a => a.id === req.params.id);
+  if(idx === -1) return res.status(404).json({ error: 'No assignment with that id.' });
+  data.assignments[idx] = Object.assign({}, data.assignments[idx], patch);
+  const saved = writeStore(data);
+  res.json({ ok: true, persisted: DISK_MOUNTED, saved, assignment: data.assignments[idx] });
+});
+
+// Delete ONE assignment by id (used for cancelling / removing a test assignment).
+app.delete('/api/store/assignments/:id', (req, res) => {
+  const data = readStore();
+  data.assignments = data.assignments || [];
+  const before = data.assignments.length;
+  data.assignments = data.assignments.filter(a => a.id !== req.params.id);
+  const saved = writeStore(data);
+  res.json({ ok: true, persisted: DISK_MOUNTED, saved, removed: before - data.assignments.length });
+});
+
+// ---- Feedback ----
+// Create ONE feedback entry. Body must include a client-generated "id" (stable so it can be
+// patched/deleted later without a round trip to fetch what id the server assigned).
 app.post('/api/store/feedback', (req, res) => {
   const entry = req.body;
-  if(!entry || typeof entry !== 'object') return res.status(400).json({ error: 'Request body must be a feedback entry object.' });
+  if(!entry || typeof entry !== 'object' || !entry.id) return res.status(400).json({ error: 'Request body must be a feedback object with an "id" field.' });
   const data = readStore();
   data.feedback = data.feedback || [];
   data.feedback.push(entry);
+  const saved = writeStore(data);
+  res.json({ ok: true, persisted: DISK_MOUNTED, saved });
+});
+
+// Merge-update ONE feedback entry by id (e.g. {status:'resolved'} or {status:'archived'}).
+app.patch('/api/store/feedback/:id', (req, res) => {
+  const patch = req.body;
+  if(!patch || typeof patch !== 'object') return res.status(400).json({ error: 'Request body must be an object of fields to update.' });
+  const data = readStore();
+  data.feedback = data.feedback || [];
+  const idx = data.feedback.findIndex(f => f.id === req.params.id);
+  if(idx === -1) return res.status(404).json({ error: 'No feedback entry with that id.' });
+  data.feedback[idx] = Object.assign({}, data.feedback[idx], patch);
+  const saved = writeStore(data);
+  res.json({ ok: true, persisted: DISK_MOUNTED, saved, feedback: data.feedback[idx] });
+});
+
+// Delete ONE feedback entry by id.
+app.delete('/api/store/feedback/:id', (req, res) => {
+  const data = readStore();
+  data.feedback = data.feedback || [];
+  const before = data.feedback.length;
+  data.feedback = data.feedback.filter(f => f.id !== req.params.id);
+  const saved = writeStore(data);
+  res.json({ ok: true, persisted: DISK_MOUNTED, saved, removed: before - data.feedback.length });
+});
+
+// ---- TL Rosters / Agent Directory / manual name overrides ----
+// These are admin-edited, low write frequency, and have no per-record delete requirement from
+// the frontend today, so a full-replace is a reasonable, simple design here (unlike assignments
+// and feedback above, which agents and TLs can both be touching concurrently).
+app.post('/api/store/tl-rosters', (req, res) => {
+  const tlRosters = req.body;
+  if(!Array.isArray(tlRosters)) return res.status(400).json({ error: 'Request body must be an array of TL rosters.' });
+  const data = readStore();
+  data.tlRosters = tlRosters;
+  const saved = writeStore(data);
+  res.json({ ok: true, persisted: DISK_MOUNTED, saved });
+});
+
+app.post('/api/store/agent-directory', (req, res) => {
+  const agentDirectory = req.body;
+  if(!Array.isArray(agentDirectory)) return res.status(400).json({ error: 'Request body must be an array of agent profiles.' });
+  const data = readStore();
+  data.agentDirectory = agentDirectory;
+  const saved = writeStore(data);
+  res.json({ ok: true, persisted: DISK_MOUNTED, saved });
+});
+
+app.post('/api/store/manual-name-overrides', (req, res) => {
+  const overrides = req.body;
+  if(!overrides || typeof overrides !== 'object' || Array.isArray(overrides)) return res.status(400).json({ error: 'Request body must be an object.' });
+  const data = readStore();
+  data.manualNameOverrides = overrides;
   const saved = writeStore(data);
   res.json({ ok: true, persisted: DISK_MOUNTED, saved });
 });
