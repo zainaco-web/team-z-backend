@@ -63,7 +63,7 @@ function readStore(){
   try{
     if(fs.existsSync(STORE_FILE)) return JSON.parse(fs.readFileSync(STORE_FILE, 'utf8'));
   }catch(err){ console.error('Reading store failed:', err); }
-  return { teamProgress: [], assignments: [], tlRosters: [], agentDirectory: [], manualNameOverrides: {}, feedback: [] };
+  return { teamProgress: [], assignments: [], tlRosters: [], agentDirectory: [], manualNameOverrides: {}, feedback: [], customScenarios: [] };
 }
 function writeStore(data){
   try{
@@ -178,9 +178,68 @@ app.delete('/api/store/feedback/:id', (req, res) => {
 });
 
 // ---- TL Rosters / Agent Directory / manual name overrides ----
-// These are admin-edited, low write frequency, and have no per-record delete requirement from
-// the frontend today, so a full-replace is a reasonable, simple design here (unlike assignments
-// and feedback above, which agents and TLs can both be touching concurrently).
+// UPDATED: these used to be admin-edited, low-frequency, single-TL operations, which is why they
+// were originally built as full-replace. That assumption no longer holds now that multiple TLs are
+// testing concurrently - two TLs registering different agents around the same time could otherwise
+// each fetch the array, add their own agent locally, and POST the whole thing back; whichever POST
+// lands second silently erases the other TL's new agent/roster entry (a classic lost-update race).
+// The /upsert endpoints below fix this the same way assignments/:id and feedback/:id already do:
+// a single synchronous read-modify-write per request, with no "fetch the old array into the
+// frontend, mutate it there, send the whole thing back" round trip for anyone else's edits to be
+// lost in. The original full-replace endpoints are kept immediately below, UNCHANGED, as a manual
+// "force full resync" escape hatch only - no current frontend flow relies on them for normal use.
+
+// Upsert ONE agent profile by canonicalName (case-insensitive). Never touches any other profile.
+app.post('/api/store/agent-directory/upsert', (req, res) => {
+  const profile = req.body;
+  if(!profile || typeof profile !== 'object' || !profile.canonicalName) return res.status(400).json({ error: 'Request body must be a profile object with a "canonicalName" field.' });
+  const data = readStore();
+  data.agentDirectory = data.agentDirectory || [];
+  const key = String(profile.canonicalName).trim().toLowerCase();
+  const idx = data.agentDirectory.findIndex(a => String((a && a.canonicalName) || '').trim().toLowerCase() === key);
+  if (idx >= 0) data.agentDirectory[idx] = profile; else data.agentDirectory.push(profile);
+  const saved = writeStore(data);
+  res.json({ ok: true, persisted: DISK_MOUNTED, saved, agentDirectory: data.agentDirectory });
+});
+
+// Upsert/merge agents into ONE TL's roster by tlName (case-insensitive). Creates the roster if it
+// doesn't exist yet. addAgents is unioned into the existing list (case-insensitive dedupe) - this
+// never removes an agent, matching every current frontend caller (there is no "remove agent from
+// roster" flow today). Every other TL's roster entry in the array is left completely untouched.
+app.post('/api/store/tl-rosters/upsert', (req, res) => {
+  const { tlName, addAgents } = req.body || {};
+  if (!tlName || typeof tlName !== 'string') return res.status(400).json({ error: 'Request body must include a "tlName" string.' });
+  const toAdd = Array.isArray(addAgents) ? addAgents.filter(Boolean) : [];
+  const data = readStore();
+  data.tlRosters = data.tlRosters || [];
+  const key = tlName.trim().toLowerCase();
+  const idx = data.tlRosters.findIndex(r => String((r && r.tlName) || '').trim().toLowerCase() === key);
+  if (idx >= 0) {
+    const agents = data.tlRosters[idx].agents ? data.tlRosters[idx].agents.slice() : [];
+    toAdd.forEach(a => { if (!agents.some(existing => String(existing).trim().toLowerCase() === String(a).trim().toLowerCase())) agents.push(a); });
+    data.tlRosters[idx] = { tlName: data.tlRosters[idx].tlName, agents };
+  } else {
+    data.tlRosters.push({ tlName: tlName.trim(), agents: toAdd });
+  }
+  const saved = writeStore(data);
+  res.json({ ok: true, persisted: DISK_MOUNTED, saved, tlRosters: data.tlRosters });
+});
+
+// Set ONE key in the manual-name-overrides map. Merges into the existing map rather than replacing
+// it, so two TLs resolving two different ambiguous names at the same time can't erase one another.
+app.post('/api/store/manual-name-overrides/set', (req, res) => {
+  const { key, canonicalName } = req.body || {};
+  if (!key || typeof key !== 'string' || !canonicalName) return res.status(400).json({ error: 'Request body must include "key" and "canonicalName" strings.' });
+  const data = readStore();
+  data.manualNameOverrides = data.manualNameOverrides || {};
+  data.manualNameOverrides[key] = canonicalName;
+  const saved = writeStore(data);
+  res.json({ ok: true, persisted: DISK_MOUNTED, saved, manualNameOverrides: data.manualNameOverrides });
+});
+
+// ---- Legacy full-replace endpoints ----
+// Kept ONLY as a manual "force full resync" escape hatch (e.g. restoring from a known-good export).
+// No current frontend flow uses these for normal registration/editing any more - see /upsert above.
 app.post('/api/store/tl-rosters', (req, res) => {
   const tlRosters = req.body;
   if(!Array.isArray(tlRosters)) return res.status(400).json({ error: 'Request body must be an array of TL rosters.' });
@@ -206,6 +265,53 @@ app.post('/api/store/manual-name-overrides', (req, res) => {
   data.manualNameOverrides = overrides;
   const saved = writeStore(data);
   res.json({ ok: true, persisted: DISK_MOUNTED, saved });
+});
+
+// ---- Custom Scenarios (TL Scenario Builder) ----
+// Same per-record pattern as assignments/feedback above - this is deliberate: several TLs can be
+// creating, editing, or reviewing scenarios at the same moment, and a whole-array replace here would
+// have exactly the lost-update race that assignments/feedback/tlRosters already had to be fixed for.
+// Every write below touches ONE scenario record by its own unique id; nothing here ever reads the
+// array, mutates it in the browser, and posts the whole thing back.
+
+// Create ONE new custom scenario. Body must include a client-generated "id" (see work.html for the
+// id-generation scheme - timestamp + device fragment + random, so two TLs creating at the same
+// instant on different devices still can't collide).
+app.post('/api/store/custom-scenarios/new', (req, res) => {
+  const entry = req.body;
+  if (!entry || typeof entry !== 'object' || !entry.id) return res.status(400).json({ error: 'Request body must be a scenario object with an "id" field.' });
+  const data = readStore();
+  data.customScenarios = data.customScenarios || [];
+  if (data.customScenarios.some(s => s.id === entry.id)) return res.status(409).json({ error: 'A custom scenario with that id already exists.' });
+  data.customScenarios.push(entry);
+  const saved = writeStore(data);
+  res.json({ ok: true, persisted: DISK_MOUNTED, saved });
+});
+
+// Merge-update ONE custom scenario by id - used for TL edits, duplicating-then-editing, visibility
+// changes, and reviewer actions (reviewStatus/reviewedBy/reviewedDate/reviewNotes/kbStatus).
+app.patch('/api/store/custom-scenarios/:id', (req, res) => {
+  const patch = req.body;
+  if (!patch || typeof patch !== 'object') return res.status(400).json({ error: 'Request body must be an object of fields to update.' });
+  const data = readStore();
+  data.customScenarios = data.customScenarios || [];
+  const idx = data.customScenarios.findIndex(s => s.id === req.params.id);
+  if (idx === -1) return res.status(404).json({ error: 'No custom scenario with that id.' });
+  data.customScenarios[idx] = Object.assign({}, data.customScenarios[idx], patch);
+  const saved = writeStore(data);
+  res.json({ ok: true, persisted: DISK_MOUNTED, saved, scenario: data.customScenarios[idx] });
+});
+
+// Delete (archive/remove) ONE custom scenario by id. Never touches teamProgress/assignments - an
+// attempt or assignment that already referenced this scenario keeps its own saved snapshot of the
+// scenario id/title and is unaffected by the scenario itself being removed from the library.
+app.delete('/api/store/custom-scenarios/:id', (req, res) => {
+  const data = readStore();
+  data.customScenarios = data.customScenarios || [];
+  const before = data.customScenarios.length;
+  data.customScenarios = data.customScenarios.filter(s => s.id !== req.params.id);
+  const saved = writeStore(data);
+  res.json({ ok: true, persisted: DISK_MOUNTED, saved, removed: before - data.customScenarios.length });
 });
 
 // The one real endpoint. Takes { system?, messages, max_tokens? } and forwards
